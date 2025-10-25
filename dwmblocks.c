@@ -23,11 +23,13 @@ typedef struct {
 	char* command;
 	unsigned int interval;
 	unsigned int signal;
+	char* clickcmd;
 } Block;
 #ifndef __OpenBSD__
 void dummysighandler(int num);
 #endif
 void sighandler(int num);
+void sighandler_info(int signum, siginfo_t *si, void *ucontext);
 void getcmds(int time);
 void getsigcmds(unsigned int signal);
 void setupsignals();
@@ -54,26 +56,36 @@ static char statusbar[LENGTH(blocks)][CMDLENGTH] = {0};
 static char statusstr[2][STATUSLENGTH];
 static int statusContinue = 1;
 static int returnStatus = 0;
+static int button = 0;  // Store button click information
 
 //opens process *cmd and stores output in *output
 void getcmd(const Block *block, char *output)
 {
-	strcpy(output, block->icon);
+	// Insert signal number as control character at the beginning
+	if (block->signal) {
+		output[0] = block->signal;
+		output++;
+	}
+
+	int j = 0;
+
+	strcpy(output+j, block->icon);
 	FILE *cmdf = popen(block->command, "r");
 	if (!cmdf)
 		return;
-	int i = strlen(block->icon);
-	fgets(output+i, CMDLENGTH-i-delimLen, cmdf);
+	int i = j + strlen(block->icon);
+	fgets(output+i, CMDLENGTH-i-delimLen-2, cmdf);
 	i = strlen(output);
-	if (i == 0) {
+	if (i == j) {
 		//return if block and command output are both empty
 		pclose(cmdf);
 		return;
 	}
 	//only chop off newline if one is present at the end
 	i = output[i-1] == '\n' ? i-1 : i;
+
 	if (delim[0] != '\0') {
-		strncpy(output+i, delim, delimLen); 
+		strncpy(output+i, delim, delimLen);
 	}
 	else
 		output[i++] = '\0';
@@ -103,16 +115,29 @@ void getsigcmds(unsigned int signal)
 void setupsignals()
 {
 #ifndef __OpenBSD__
-	    /* initialize all real time signals with dummy handler */
-    for (int i = SIGRTMIN; i <= SIGRTMAX; i++)
-        signal(i, dummysighandler);
-#endif
+	/* initialize all real time signals with dummy handler */
+	for (int i = SIGRTMIN; i <= SIGRTMAX; i++)
+		signal(i, dummysighandler);
 
+	/* Set up SIGUSR1 handler for dwm click signals */
+	struct sigaction sa;
+	sa.sa_sigaction = sighandler_info;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGUSR1, &sa, NULL);
+
+	/* Set up real-time signal handlers for block updates */
 	for (unsigned int i = 0; i < LENGTH(blocks); i++) {
 		if (blocks[i].signal > 0)
 			signal(SIGMINUS+blocks[i].signal, sighandler);
 	}
-
+#else
+	/* OpenBSD setup */
+	for (unsigned int i = 0; i < LENGTH(blocks); i++) {
+		if (blocks[i].signal > 0)
+			signal(SIGMINUS+blocks[i].signal, sighandler);
+	}
+#endif
 }
 
 int getstatus(char *str, char *last)
@@ -122,6 +147,21 @@ int getstatus(char *str, char *last)
 	for (unsigned int i = 0; i < LENGTH(blocks); i++)
 		strcat(str, statusbar[i]);
 	str[strlen(str)-strlen(delim)] = '\0';
+
+	// Debug: log the status string with control characters
+	FILE *f = fopen("/tmp/dwmblocks-status.log", "w");
+	if (f) {
+		fprintf(f, "Status string (len=%zu):\n", strlen(str));
+		for (size_t i = 0; i < strlen(str); i++) {
+			if (str[i] < 32)
+				fprintf(f, "[%d]", (unsigned char)str[i]);
+			else
+				fprintf(f, "%c", str[i]);
+		}
+		fprintf(f, "\n");
+		fclose(f);
+	}
+
 	return strcmp(str, last);//0 if they are the same
 }
 
@@ -178,9 +218,52 @@ void dummysighandler(int signum)
 }
 #endif
 
+void sighandler_info(int signum, siginfo_t *si, void *ucontext)
+{
+	(void)signum;
+	(void)ucontext;
+
+	// Extract signal and button from value
+	// dwm sends: sv.sival_int = 0 | (dwmblockssig << 8) | button
+	int signal = 0;
+	if (si) {
+		button = si->si_value.sival_int & 0xFF;
+		signal = (si->si_value.sival_int >> 8) & 0xFF;
+
+		// Debug logging
+		FILE *f = fopen("/tmp/dwmblocks-debug.log", "a");
+		if (f) {
+			fprintf(f, "Click received: signal=%d, button=%d, sival_int=%d\n",
+			        signal, button, si->si_value.sival_int);
+			fclose(f);
+		}
+	}
+
+	// If it's a left click (button 1), execute the click command
+	if (button == 1 && signal > 0) {
+		for (unsigned int i = 0; i < LENGTH(blocks); i++) {
+			if (blocks[i].signal == signal && blocks[i].clickcmd) {
+				// Fork and execute the click command
+				if (fork() == 0) {
+					execl("/bin/sh", "sh", "-c", blocks[i].clickcmd, NULL);
+					exit(0);
+				}
+				break;
+			}
+		}
+	}
+
+	if (signal > 0) {
+		getsigcmds(signal);
+		writestatus();
+	}
+}
+
 void sighandler(int signum)
 {
-	getsigcmds(signum-SIGPLUS);
+	// Handle real-time signals for block updates
+	int signal = signum - SIGPLUS;
+	getsigcmds(signal);
 	writestatus();
 }
 
